@@ -279,6 +279,7 @@ details.help summary{cursor:pointer;font:700 16px var(--f-display)}
       <div class="make">
         <div class="row">
           <button id="makeBtn" class="btn primary" disabled>Make melody from audio</button>
+          <button id="alignBtn" class="btn" disabled>Line up MIDI with audio</button>
           <select id="engine" aria-label="Transcription engine">
             <option value="quick">Quick (built-in)</option>
             <option value="neural">Neural (Spotify Basic Pitch)</option>
@@ -610,6 +611,7 @@ function useMidiBuffer(ab, source, title, artist){
   midiTracks.forEach((t,i)=> sel.appendChild(el('option', {value:i, textContent:t.label})));
   sel.value = best; $('trackField').hidden = midiTracks.length < 2;
   setChart(chartFromMidiTrack(best), {keepMeta:true});
+  if(audioSrc) alignToAudio();
 }
 
 /* ---------- MIDI write ---------- */
@@ -654,6 +656,7 @@ function updateSources(){
   $('sources').textContent = 'Audio: ' + a + '  ·  Melody: ' + c + '  ·  Lyrics: ' + l;
   $('modeTag').textContent = chart ? 'Song mode · distance to target' : 'Free singing · distance to nearest note';
   $('makeBtn').disabled = !audioSrc || making;
+  $('alignBtn').disabled = !audioSrc || making || !alignable();
   $('lyricsBox').hidden = !lyrics;
 }
 
@@ -665,6 +668,7 @@ function setAudio(src, url){
   if(audioURL) URL.revokeObjectURL(audioURL);
   audioURL = src.kind === 'file' ? url : null;
   audioLoaded = false; audioSrc = src;
+  if(lyrics && lyrics.base) lyrics.lines = lyrics.base.map(l => ({...l}));   // undo any preview shift
   audio.src = url;
   audio.onloadedmetadata = () => { audioLoaded = true; updateSources(); updateTransportUI(); };
   audio.onerror = () => { audioLoaded = false; audioSrc = null; showMsg('That audio could not be played by this browser. Try an MP3, M4A or WAV.'); updateSources(); };
@@ -673,10 +677,12 @@ function setAudio(src, url){
 function loadAudioFile(f){
   setAudio({kind:'file', file:f, name:f.name}, URL.createObjectURL(f));
   if(!pick){ $('title').value = f.name.replace(/\.[^.]+$/,''); $('artist').value = ''; }
-  if(!chart || chart.demo){
-    chart = null; resetRun(); updateSources();
-    makeMelody('quick');           // auto-trace the melody of a freshly loaded song
-  }
+  autoMelody();
+}
+/* New audio: line an existing MIDI up with it, or trace the singer if there is no MIDI. */
+function autoMelody(){
+  if(alignable()) alignToAudio();
+  else { if(chart) { chart = null; resetRun(); updateSources(); } makeMelody('quick'); }
 }
 $('audioFile').onchange = e => { if(e.target.files[0]) loadAudioFile(e.target.files[0]); e.target.value=''; };
 $('kitAudio').onchange = e => { if(e.target.files[0]) loadAudioFile(e.target.files[0]); e.target.value=''; };
@@ -694,7 +700,7 @@ async function loadChartFile(f){
     hideMsg();
   }catch(e){ showMsg('Could not read that chart: ' + e.message); }
 }
-$('trackSel').onchange = e => { try{ setChart(chartFromMidiTrack(+e.target.value), {keepMeta:true}); }catch(err){ showMsg(err.message); } };
+$('trackSel').onchange = e => { try{ setChart(chartFromMidiTrack(+e.target.value), {keepMeta:true}); if(audioSrc) alignToAudio(); }catch(err){ showMsg(err.message); } };
 $('chartFile').onchange = e => { if(e.target.files[0]) loadChartFile(e.target.files[0]); e.target.value=''; };
 $('demoBtn').onclick = () => { $('trackField').hidden = true; setChart(demoChart()); };
 $('title').oninput = e => { if(chart) chart.title = e.target.value; };
@@ -750,35 +756,96 @@ function decodeAudio(ab){
     catch(e){ rej(e); }
   });
 }
-function renderAt(buf, sr, vocalBand, aaCut){
+function renderAt(buf, sr, vocalBand, aaCut, ch){
   const OAC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
-  const oc = new OAC(1, Math.ceil(buf.duration * sr), sr);
+  const oc = new OAC(ch, Math.ceil(buf.duration * sr), sr);
   const s = oc.createBufferSource(); s.buffer = buf;
   let node = s;
   const filt = (type, f) => { const b = oc.createBiquadFilter(); b.type = type; b.frequency.value = f; node.connect(b); node = b; };
   if(vocalBand){ filt('highpass', 90); filt('lowpass', 1600); }
   if(aaCut) filt('lowpass', aaCut);
   node.connect(oc.destination); s.start();
+  const chans = b => Array.from({length: ch}, (_, i) => b.getChannelData(i));
   return new Promise((res, rej) => {
-    oc.oncomplete = e => res(e.renderedBuffer.getChannelData(0));
+    oc.oncomplete = e => res(chans(e.renderedBuffer));
     const p = oc.startRendering();
-    if(p && p.then) p.then(b => res(b.getChannelData(0)), rej);
+    if(p && p.then) p.then(b => res(chans(b)), rej);
   });
 }
-/* Mono, band-limited render at the target rate. Some Safari versions refuse unusual
-   offline sample rates, so fall back to the device rate and decimate. */
-async function renderMono(buf, sr, vocalBand){
-  try{ return await renderAt(buf, sr, vocalBand, 0); }
+/* Band-limited render at the target rate. Some Safari versions refuse unusual
+   offline sample rates, so fall back to the device rate and resample. */
+async function renderChannels(buf, sr, vocalBand, ch){
+  try{ return await renderAt(buf, sr, vocalBand, 0, ch); }
   catch(e){
     const base = ctx.sampleRate, step = base / sr;
-    const full = await renderAt(buf, base, vocalBand, sr * 0.45);   // low-pass first to avoid aliasing
-    const out = new Float32Array(Math.floor((full.length - 1) / step));
-    for(let i=0;i<out.length;i++){ const p = i*step, j = p|0, f = p - j; out[i] = full[j]*(1-f) + full[j+1]*f; }
-    return out;
+    const full = await renderAt(buf, base, vocalBand, sr * 0.45, ch);   // low-pass first to avoid aliasing
+    return full.map(src => {
+      const out = new Float32Array(Math.floor((src.length - 1) / step));
+      for(let i=0;i<out.length;i++){ const p = i*step, j = p|0, f = p - j; out[i] = src[j]*(1-f) + src[j+1]*f; }
+      return out;
+    });
   }
 }
-/* Quick engine: frame-wise YIN on the band-limited mono mix, then note segmentation. */
-async function quickMelody(x, sr){
+async function renderMono(buf, sr, vocalBand){ return (await renderChannels(buf, sr, vocalBand, 1))[0]; }
+
+/* In-place radix-2 FFT (inv = inverse, scaled). */
+function fft(re, im, inv){
+  const n = re.length;
+  for(let i=1, j=0; i<n; i++){
+    let bit = n >> 1; for(; j & bit; bit >>= 1) j ^= bit; j ^= bit;
+    if(i < j){ let t = re[i]; re[i] = re[j]; re[j] = t; t = im[i]; im[i] = im[j]; im[j] = t; }
+  }
+  for(let len=2; len<=n; len<<=1){
+    const ang = 2*Math.PI/len*(inv ? 1 : -1), wr = Math.cos(ang), wi = Math.sin(ang), h = len >> 1;
+    for(let i=0; i<n; i+=len){
+      let cr = 1, ci = 0;
+      for(let k=0; k<h; k++){
+        const a = i+k, b = a+h;
+        const xr = re[b]*cr - im[b]*ci, xi = re[b]*ci + im[b]*cr;
+        re[b] = re[a]-xr; im[b] = im[a]-xi; re[a] += xr; im[a] += xi;
+        const t = cr*wr - ci*wi; ci = cr*wi + ci*wr; cr = t;
+      }
+    }
+  }
+  if(inv) for(let i=0;i<n;i++){ re[i] /= n; im[i] /= n; }
+}
+/* Lead vocals are almost always mixed dead centre, while guitars, keys and backing parts
+   are spread left and right. Keep only the time-frequency bins where left and right agree. */
+async function centerExtract(L, R, p0, p1){
+  const N = 1024, H = 256, n = Math.min(L.length, R.length);
+  const w = new Float64Array(N); for(let i=0;i<N;i++) w[i] = 0.5 - 0.5*Math.cos(2*Math.PI*i/N);
+  const out = new Float32Array(n), norm = new Float32Array(n);
+  const lr = new Float64Array(N), li = new Float64Array(N), rr = new Float64Array(N), ri = new Float64Array(N);
+  let fr = 0; const total = Math.ceil((n + N)/H);
+  for(let o = -N + H; o < n; o += H){
+    for(let i=0;i<N;i++){ const k = o+i, ok = k >= 0 && k < n; lr[i] = ok ? L[k]*w[i] : 0; rr[i] = ok ? R[k]*w[i] : 0; li[i] = 0; ri[i] = 0; }
+    fft(lr, li, false); fft(rr, ri, false);
+    for(let k=0;k<N;k++){
+      const sr = lr[k]+rr[k], si = li[k]+ri[k], dr = lr[k]-rr[k], di = li[k]-ri[k];
+      const ms = Math.hypot(sr, si), md = Math.hypot(dr, di);
+      let m = ms > 1e-9 ? 1 - md/ms : 0; if(m < 0) m = 0; m = m*m;
+      lr[k] = 0.5*sr*m; li[k] = 0.5*si*m;
+    }
+    fft(lr, li, true);
+    for(let i=0;i<N;i++){ const k = o+i; if(k >= 0 && k < n){ out[k] += lr[i]*w[i]; norm[k] += w[i]*w[i]; } }
+    if(++fr % 400 === 0){ setMake('Isolating the voice… ' + Math.round(fr/total*100) + '%', p0 + (p1-p0)*fr/total); await tick0(); }
+  }
+  for(let i=0;i<n;i++) out[i] = norm[i] > 1e-6 ? out[i]/norm[i] : 0;
+  return out;
+}
+/* Vocal melody: centre-channel isolation (stereo songs), vocal band-pass, then pitch tracking. */
+async function vocalNotes(buf){
+  setMake('Isolating the voice…', 2);
+  let x;
+  if(buf.numberOfChannels >= 2){
+    const [L, R] = await renderChannels(buf, 16000, true, 2);
+    let diff = 0, sum = 0; for(let i=0;i<L.length;i+=97){ diff += Math.abs(L[i]-R[i]); sum += Math.abs(L[i]+R[i]); }
+    x = diff > 0.02*sum ? await centerExtract(L, R, 2, 35) : L;     // skip when the file is really mono
+  } else x = await renderMono(buf, 16000, true);
+  return quickMelody(x, 16000, 35, 95);
+}
+/* Quick engine: frame-wise YIN on the band-limited signal, then note segmentation. */
+async function quickMelody(x, sr, p0=0, p1=90){
   const win = 1024, hop = 240, nF = Math.max(0, Math.floor((x.length - win)/hop));
   const rmsA = new Float32Array(nF);
   for(let f=0; f<nF; f++){ let s=0; const o=f*hop; for(let i=0;i<win;i+=2) s += x[o+i]*x[o+i]; rmsA[f] = Math.sqrt(s/(win/2)); }
@@ -790,7 +857,7 @@ async function quickMelody(x, sr){
       const r = yin(x, f*hop, win, sr, 0.2, 0.32);
       if(r && r.f > 75 && r.f < 1100) pitch[f] = freqToMidi(r.f);
     }
-    if(f % 300 === 0){ setMake('Tracing pitch… ' + Math.round(f/nF*100) + '%', f/nF*90); await tick0(); }
+    if(f % 300 === 0){ setMake('Tracing the vocal pitch… ' + Math.round(f/nF*100) + '%', p0 + (p1-p0)*f/nF); await tick0(); }
   }
   // median filter (5) over voiced frames
   const sm = new Float32Array(nF).fill(NaN);
@@ -865,29 +932,110 @@ async function neuralMelody(buf){
   }
   return cleanNotes(kept.map(n => ({t:n.t, d:n.d, m:n.m, lyric:''})));
 }
+let vocalCache = null;   // {src, notes, dur}: the traced vocal line of the current audio
+async function decodeCurrent(){
+  setMake('Decoding audio…', 1); ensureCtx();
+  return decodeAudio(await audioArrayBuffer());
+}
+async function currentVocal(){
+  if(vocalCache && vocalCache.src === audioSrc) return vocalCache;
+  const src = audioSrc, buf = await decodeCurrent();
+  const notes = await vocalNotes(buf);
+  vocalCache = {src, notes, dur: buf.duration};
+  return vocalCache;
+}
+function explainFail(e, what){
+  const cors = /fetch|network|cors|preview server|load failed/i.test((e && e.message) || '') && audioSrc && audioSrc.kind==='url';
+  return cors ? 'The preview plays here, but its server won\'t let the page read the sound itself, so it can\'t ' + what + '. Load your own MP3 of the song instead.'
+              : 'Could not ' + what + ': ' + ((e && e.message) || e);
+}
 async function makeMelody(engine){
   if(!audioSrc || making) return;
   making = true; updateSources(); hideMsg();
   const srcName = audioSrc.name;
   try{
-    setMake('Decoding audio…', 1); ensureCtx();
-    const buf = await decodeAudio(await audioArrayBuffer());
     let notes;
-    if(engine === 'neural') notes = await neuralMelody(buf);
-    else { setMake('Isolating the vocal range…', 1); notes = await quickMelody(await renderMono(buf, 16000, true), 16000); }
-    if(!notes.length) throw new Error('no clear melody was found');
+    if(engine === 'neural') notes = await neuralMelody(await decodeCurrent());
+    else notes = (await currentVocal()).notes;
+    if(!notes.length) throw new Error('no clear vocal melody was found');
     $('trackField').hidden = true;
-    setChart(finishChart({title: $('title').value || srcName, artist: $('artist').value, bpm: null, notes,
-      source: 'Made from ' + srcName + (engine==='neural' ? ' (neural)' : ' (quick)')}), {keepMeta:true});
+    const c = finishChart({title: $('title').value || srcName, artist: $('artist').value, bpm: null,
+      notes: notes.map(n => ({...n})), source: 'Traced from ' + srcName + (engine==='neural' ? ' (neural)' : ' (voice)')});
+    c.fromAudio = true;
+    setChart(c, {keepMeta:true});
     S.offset = 0; showOffset(); save();
-    setMake('Melody ready: ' + notes.length + ' notes. Export it as MIDI, or try the other engine if it follows the wrong instrument.', null);
-  }catch(e){
-    const cors = /fetch|network|cors|preview server/i.test(e.message || '') && audioSrc && audioSrc.kind==='url';
-    setMake(cors ? 'The preview can play here but its server won\'t let the page read the audio data. Load your own MP3 of the song to make a melody.'
-                 : 'Could not make a melody: ' + (e.message || e), null);
-  }finally{ making = false; updateSources(); }
+    setMake('Melody ready: ' + notes.length + ' notes traced from the singer, in time with this audio. Export it as MIDI if you like.', null);
+  }catch(e){ setMake(explainFail(e, 'make a melody'), null); }
+  finally{ making = false; updateSources(); }
 }
 $('makeBtn').onclick = () => makeMelody($('engine').value);
+
+/* ---------- line a chart (e.g. an online MIDI) up with the audio ---------- */
+function pcRoll(notes, len, scale, shift){
+  const a = new Int8Array(len).fill(-1);
+  for(const n of notes){
+    const s = Math.max(0, Math.round((n.t*scale + shift)*20)), e = Math.min(len, Math.round(((n.t+n.d)*scale + shift)*20));
+    const p = pc(n.m); for(let f=s; f<e; f++) a[f] = p;
+  }
+  return a;
+}
+/* Slide (and slightly stretch) the chart against the traced vocal; score = pitch-class agreement. */
+async function findAlignment(ref, aud, audDur){
+  const fps = 20, La = Math.ceil(audDur*fps) + 1, A = pcRoll(aud, La, 1, 0);
+  let av = 0; for(let i=0;i<La;i++) if(A[i] >= 0) av++;
+  if(av < 20) return null;
+  const refEnd = Math.max(...ref.map(n => n.t + n.d));
+  let best = null;
+  const scales = [1, 0.99, 1.01, 0.98, 1.02, 0.97, 1.03, 0.96, 1.04, 0.95, 1.05];
+  for(let si=0; si<scales.length; si++){
+    const s = scales[si], Lr = Math.ceil(refEnd*s*fps) + 1, Rr = pcRoll(ref, Lr, s, 0);
+    let kMin = -Lr, kMax = La;
+    if(audDur > 90){ kMin = Math.max(kMin, -90*fps); kMax = Math.min(kMax, 90*fps); }
+    for(let k=kMin; k<kMax; k++){
+      let hit = 0, miss = 0;
+      const i0 = Math.max(0, -k), i1 = Math.min(Lr, La - k);
+      for(let i=i0; i<i1; i++){ const r = Rr[i]; if(r < 0) continue; const a = A[i+k]; if(a < 0) continue; if(a === r) hit++; else miss++; }
+      const sc = hit - 0.6*miss;
+      if(!best || sc > best.sc) best = {sc, hit, miss, k, s};
+    }
+    setMake('Lining the melody up with the singer… ' + Math.round((si+1)/scales.length*100) + '%', 95 + 5*(si+1)/scales.length);
+    await tick0();
+  }
+  best.ratio = best.hit / av;
+  best.lag = best.k / fps;
+  return best;
+}
+const alignable = () => chart && !chart.fromAudio && !chart.demo;
+async function alignToAudio(){
+  if(!audioSrc || !alignable() || making) return;
+  making = true; updateSources(); hideMsg();
+  const c = chart;
+  if(!c.base) c.base = c.notes.map(n => ({...n}));
+  try{
+    const v = await currentVocal();
+    if(!v.notes.length) throw new Error('no clear vocal melody was found in the audio');
+    const b = await findAlignment(c.base, v.notes, v.dur);
+    if(chart !== c) return;
+    if(!b || b.ratio < 0.15){
+      setMake('This MIDI doesn\'t match what the singer sings in this audio' + (b ? ' (only ' + Math.round(b.ratio*100) + '% agreement)' : '') +
+        '. Try another MIDI or MIDI track, or press "Make melody from audio" to trace the singer directly.', null);
+      return;
+    }
+    c.notes = c.base.map(n => ({...n, t: n.t*b.s + b.lag, d: n.d*b.s}));
+    c.aligned = true;
+    S.offset = 0; showOffset(); save();
+    if(lyrics && audioSrc.kind === 'url'){              // preview clip: shift timed lyrics by the same amount
+      if(!lyrics.base) lyrics.base = lyrics.lines.map(l => ({...l}));
+      lyrics.lines = lyrics.base.map(l => ({...l, t: l.t + b.lag}));
+    }
+    setChart(c, {keepMeta:true});
+    const where = b.lag < 0 ? 'this audio starts ' + fmtTime(-b.lag) + ' into the MIDI' : 'the MIDI starts ' + b.lag.toFixed(1) + 's into this audio';
+    setMake('Lined up with the singer (' + Math.round(b.ratio*100) + '% of sung notes agree; ' + where +
+      (Math.abs(b.s-1) > 0.005 ? ', tempo adjusted ' + Math.round((b.s-1)*100) + '%' : '') + ').', null);
+  }catch(e){ setMake(explainFail(e, 'line the melody up'), null); }
+  finally{ making = false; updateSources(); }
+}
+$('alignBtn').onclick = () => alignToAudio();
 
 /* ---------- song search & online lookup ---------- */
 let pick = null, pickToken = 0;
@@ -957,6 +1105,7 @@ async function choose(it){
 $('kitPreview').onclick = () => {
   if(!pick || !pick.preview) return;
   setAudio({kind:'url', url:pick.preview, name: pick.title + ' (30s preview)'}, pick.preview);
+  autoMelody();
 };
 
 function parseLrc(txt){
@@ -1052,8 +1201,8 @@ async function findMidi(it, token){
     const open = el('a', {className:'btn sm', target:'_blank', rel:'noopener', href:'https://bitmidi.com/' + (x.slug || ''), textContent:'View'});
     list.append(el('div', {className:'midi-item'}, el('span', {textContent: x.name || x.slug}), el('div', {className:'row'}, open, use)));
   }
-  box.replaceChildren(pill('ok', scored.length + ' possible MIDI ' + (scored.length===1?'file':'files') + ' found. Fan-made files may need the melody offset to line up.'), list, links);
-  if(!chart) list.querySelector('button').click();
+  box.replaceChildren(pill('ok', scored.length + ' possible MIDI ' + (scored.length===1?'file':'files') + ' found. These are fan-made: when you use one, Pitch Lane lines it up with the singer in your audio automatically.'), list, links,
+    el('p', {className:'hint', textContent:'Usually the best match is to skip MIDI and let Pitch Lane trace the singer from the audio, which happens on its own when you add audio.'}));
 }
 
 /* ---------- transport ---------- */

@@ -1,5 +1,5 @@
 // Pitch Lane offline shell: network first so updates arrive, cache as fallback.
-const CACHE = 'pitch-lane-v3';
+const CACHE = 'pitch-lane-v4';
 const SHELL = ['./', './index.html', './manifest.webmanifest', './icon-180.png', './icon-192.png', './icon-512.png'];
 self.addEventListener('install', e => { e.waitUntil(caches.open(CACHE).then(c => c.addAll(SHELL))); self.skipWaiting(); });
 self.addEventListener('activate', e => {
